@@ -834,7 +834,7 @@
 
 ---
 
-### EVENTS_VOTES
+### EVENTS_VOTES_AGG
 
 | Column Name | Description | Example | Comments |
 |-------------|-------------|---------|----------|
