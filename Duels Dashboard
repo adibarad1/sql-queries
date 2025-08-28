@@ -1,0 +1,401 @@
+-- =========================================================
+-- Name: duel_dashboard_daily_member_metrics.sql
+-- Title: Duels Dashboard – Daily Member Metrics + Retention
+-- Purpose:
+--   Build a per-member, per-day fact table for the Duels feature, combining
+--   activity, monetization, resource flows, duel-state KPIs, achievements,
+--   and retention indicators (D+1..D+7, D+14) relative to first Duel join.
+--
+-- Grain:
+--   One row per member_id per activity date (dau.date).
+--
+-- Primary Use:
+--   Backend table for the Duels dashboard (exploration, cohorting, retention,
+--   monetization, and ops monitoring).
+--
+-- Time Window / Cutoffs:
+--   - Activity spine (DAU) from 2024-12-08 onward (hardcoded in this version).
+--   - USER/EVENT cutoff: e.CLIENT_TIME::DATE < CURRENT_DATE.
+--   - Excludes app_version = '9.99.0' in CLIENT_EVENTS (data hygiene).
+--
+-- Sources:
+--   - GURUSHOTS."Analytics".AGG_USER_SESSION                                (DAU spine, sessions)
+--   - EVENTS.PUBLIC.CLIENT_EVENTS_OBJECTS_PRD                                (signup/app_version gates)
+--   - PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER                    (registration date/status)
+--   - PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER_SETTINGS           (registration platform/OS)
+--   - PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER_PROFILE            (country_code -> Region)
+--   - PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.PAYMENTS                  (paid revenue per date)
+--   - PC_FIVETRAN_DB.MAIN_APPLICATION_PRODUCTION.MEMBER_PERMISSIONS_HISTORY (resource inflows, reason like '%duel%')
+--   - PC_FIVETRAN_DB.MAIN_APPLICATION_PRODUCTION.EVENTS_COINS               (COINS out, param='DUEL')
+--   - PC_FIVETRAN_DB.GSMS_MAIN_DUELS.DUELS / DUEL_PARTICIPANTS              (duel states & join metrics)
+--   - PC_FIVETRAN_DB.ACHIEVEMENTS_ACHIEVEMENTS.MEMBERS_ACHIEVEMENTS         (duel-related streaks)
+--
+-- Logic Overview:
+--   1) users: Build user dimension (member_id, reg_date, status, country/Region,
+--      reg_platform, and anonymous signup marker), excluding app_version 9.99.0 and
+--      limiting CLIENT_TIME to < CURRENT_DATE.
+--   2) dau: Daily activity spine (distinct member_id x date) derived from sessions,
+--      aligned with users; ensures date >= '2024-12-08' and respects reg_date (if present).
+--   3) payments: Daily revenue per member (non-refunded, paid). Dates < '2024-12-08'
+--      are clamped to '2024-12-08' for cohesion with the activity window.
+--   4) resources_in: Daily resource inflows from MEMBER_PERMISSIONS_HISTORY for
+--      events related to Duels (reason like '%duel%'), split by PHOTO_SWAP/COINS/
+--      EXPOSURE_AUTOFILL/KEY.
+--   5) coins_out: Daily coins out from EVENTS_COINS where param='DUEL'.
+--   6) duel_data: Per-member, per-join-date metrics: duels count, wins, duel
+--      durations, seconds between joins, state counts (MATCHING/ACTIVE/OVER),
+--      votes_to_win gap (when OVER), “only_1_in_duel”, and join coin tiers
+--      (10/30/50/100) parsed from CHALLENGE_DATA.
+--   7) first_join: First Duel join date per member (anchor for retention).
+--   8) achievements: Daily count of duel-related achievements (streaks).
+--   9) Final: Left-join all components onto the DAU spine and aggregate per day.
+--      Emit retention flags ret1..ret7, ret14 where a member re-joined a Duel on
+--      exactly those offsets vs first_join_date.
+--
+-- Output Columns (selected):
+--   member_id, reg_date, member_status_name, country_code, Region, reg_platform,
+--   first_join_date, date,
+--   ret1, ret2, ret3, ret4, ret5, ret6, ret7, ret14,           -- retention flags
+--   revenue,
+--   PHOTO_SWAP_in, KEY_in, COINS_in, EXPOSURE_AUTOFILL_in,      -- resource inflows
+--   COINS_OUT,                                                  -- resource outflow
+--   duels, total_wins, seconds_between_joins, duel_duration,
+--   joined_2, over, matching, active, only_1_in_duel,
+--   votes_to_win, streak_achievements,
+--   ten_Join_coins, thirty_Join_Coins, fifty_Join_coins, hundred_Join_coins
+--
+-- Retention Definition:
+--   For a member with first_join_date = D0, retN is populated on a calendar date
+--   where there is a Duel join on D0 + N days (N ∈ {1..7,14}). Flags are per-day,
+--   based on duel_data.join_date.
+--
+-- Assumptions / Notes:
+--   - Region mapping is simplified: US/CA => North_America; a comprehensive list => Europe; else ROW.
+--   - DAU spine ensures we report zeros when no activity was recorded on a given date for a known member.
+--   - Payments are filtered to refunded = FALSE and is_paid = 1; pay_date clamped to start of window.
+--   - Resource inflows use ABS(changed) to capture magnitude regardless of +/- notation.
+--   - EVENTS_COINS filtered to param='DUEL' to isolate duel-related spend.
+--   - This version hardcodes the start date ('2024-12-08'); backfilling requires adjusting filters.
+--
+-- Data Quality / QA Ideas:
+--   - Uniqueness: member_id + date should be unique in the final SELECT.
+--   - Sanity: ret* flags only after first_join_date; no ret* before D0.
+--   - Volume checks vs raw DUEL_PARTICIPANTS by day; revenue totals vs PAYMENTS.
+--   - Null rates for Region/country_code/platform; distribution by OS/Region.
+--
+-- Owners:
+--   Analyst: Adi (BI/Data) | Team: Analytics
+--   Change log: Initial commit – adds retention flags and duel KPIs on daily grain.
+-- =========================================================
+
+WITH users AS (
+    SELECT
+        s.user_id as member_id,
+        m.reg_date::date AS reg_date,
+        m.MEMBER_STATUS_NAME,
+        MAX(mp.country_code) AS country_code,
+        MAX(
+            CASE
+                WHEN mp.country_code IN ('US', 'CA') THEN 'North_America'
+                WHEN mp.country_code IN (
+                    'PL', 'RO', 'UA', 'MD', 'GB', 'UK', 'RU', 'ES', 'FR', 'DE', 'LT', 'BA', 'EE', 'CH', 'TR', 'PT',
+                    'CZ', 'GR', 'IT', 'DK', 'RS', 'MK', 'BE', 'NL', 'IM', 'MT', 'GE', 'SI', 'IS', 'AZ', 'IE', 'ME',
+                    'AT', 'NO', 'LU', 'LI', 'VA', 'FO', 'SE', 'LV', 'AD', 'SK', 'GG', 'JE', 'AL', 'HR', 'HU', 'BG',
+                    'FI', 'XK', 'AX', 'BY', 'KZ', 'SJ', 'FX', 'GI', 'YU', 'MC', 'CY', 'SM'
+                ) THEN 'Europe'
+                ELSE 'ROW'
+            END
+        ) AS Region,
+        MAX(CASE WHEN me.REG_PLATFORM = 'mobile_app' THEN me.REG_OS ELSE 'Web' END) AS reg_platform,
+        MAX(CASE WHEN e.EVENT = 'anonymous_signup' AND e.CLIENT_TIME::date = m.reg_date::date THEN 1 ELSE 0 END) AS is_anonymous_signup_event
+    FROM GURUSHOTS."Analytics".AGG_USER_SESSION s
+    left join EVENTS.PUBLIC.CLIENT_EVENTS_OBJECTS_PRD e on s.user_id = e.member_id
+    JOIN 
+        PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER m ON s.user_id = m.ID
+    LEFT JOIN 
+        PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER_SETTINGS me ON s.user_id = me.MEMBER_ID
+    LEFT JOIN 
+        PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.MEMBER_PROFILE mp ON s.user_id = mp.MEMBER_ID
+    WHERE  e.CLIENT_TIME::DATE < CURRENT_DATE 
+    AND e.AUDIENCE:app_version::string <> '9.99.0'
+    GROUP BY 
+        s.user_id, 
+        m.reg_date::date, 
+        m.MEMBER_STATUS_NAME        
+),
+
+dau as (
+select distinct s.user_id as member_id, 
+        s.start_time::date as date,
+        u.reg_date as reg_date, 
+        u.MEMBER_STATUS_NAME,
+        u.country_code, 
+        u.Region,
+        u.reg_platform
+        from  
+users u
+full join GURUSHOTS."Analytics".AGG_USER_SESSION s
+on u.member_id = s.user_id
+and (u.reg_date<=s.start_time::date OR u.reg_date IS NULL)
+where s.start_time::date>= '2024-12-08'
+--and s.member_id = 'bd0380d22aeb251fa0cdc77bec2966b6'
+),
+
+payments as (
+    SELECT distinct
+        u.member_id, 
+        u.reg_date, 
+        u.member_status_name,
+        u.country_code,
+        u.region,
+        u.reg_platform,
+        case when p.date_paid::date < '2024-12-08' then '2024-12-08' else date_paid::date end AS pay_date,
+        CASE WHEN p.is_paid = 1 THEN p.member_id END AS payer_id,
+        SUM(p.amount) AS revenue
+    FROM dau u 
+    LEFT JOIN PC_FIVETRAN_DB.MAIN2_APPLICATION_PRODUCTION.PAYMENTS p
+    ON u.member_id = p.member_id
+    WHERE refunded = FALSE 
+    AND is_paid = 1
+    AND (date_paid >= u.reg_date OR u.reg_date IS NULL)
+    GROUP BY u.member_id, 
+        u.reg_date, 
+        u.member_status_name,
+        u.country_code,
+        u.region,
+        u.reg_platform,
+        case when p.date_paid::date < '2024-12-08' then '2024-12-08' else date_paid::date end,
+        CASE WHEN p.is_paid = 1 THEN p.member_id END
+),
+
+resources_in AS (
+   select dau.member_id,
+   dau.reg_date, 
+   dau.member_status_name, 
+   dau.country_code,
+   dau.region,
+   dau.reg_platform,
+   r.date,
+   (SUM(ABS(CASE WHEN event_type = 'PHOTO_SWAP' THEN changed END))) AS PHOTO_SWAP_in,
+    (SUM(ABS(CASE WHEN event_type = 'COINS' THEN changed END))) AS COINS_in,
+    (SUM(ABS(CASE WHEN event_type = 'EXPOSURE_AUTOFILL' THEN changed END))) AS EXPOSURE_AUTOFILL_in,
+    (SUM(ABS(CASE WHEN event_type = 'KEY' THEN changed END))) AS KEY_in 
+   from
+   (SELECT 
+        member_id, 
+        event_type,
+        date::date AS date,
+        sum(abs(h.changed)) as changed,
+    FROM PC_FIVETRAN_DB.MAIN_APPLICATION_PRODUCTION.MEMBER_PERMISSIONS_HISTORY h
+    WHERE h.reason LIKE '%duel%' 
+    and h.date::date>='2024-12-08'
+    GROUP BY h.member_id, 
+        h.event_type, 
+        h.date::date) r
+        right join dau on r.member_id = dau.member_id 
+        and dau.date = r.date
+        where (r.date >= dau.reg_date OR dau.reg_date IS NULL)
+        group by dau.member_id,
+   dau.reg_date, 
+   dau.member_status_name, 
+   dau.country_code,
+   dau.region,
+   dau.reg_platform,
+   r.date
+),
+
+coins_out as (
+select u.member_id,  
+        u.reg_date, 
+        u.member_status_name,
+        u.country_code,
+        u.region,
+        u.reg_platform,
+        c.date::date as date, 
+        sum(c.value) as COINS_OUT
+from dau u
+left join PC_FIVETRAN_DB.MAIN_APPLICATION_PRODUCTION.EVENTS_COINS c
+on u.member_id = c.member_id
+and u.date = c.date::date
+where c.param = 'DUEL'
+and c._fivetran_deleted = false 
+and c.date::date>='2024-12-08'
+and (c.date>=u.reg_date or c.date is null OR u.reg_date IS NULL)
+group by u.member_id,  
+        u.reg_date, 
+        u.member_status_name,
+        u.country_code,
+        u.region,
+        u.reg_platform,
+        c.date::date
+),
+
+duel_data AS (
+    SELECT 
+        member_id,
+        join_date::date AS join_date,
+        --lag(join_date::date) OVER (PARTITION BY member_id ORDER BY join_date::date) AS previous_join_date,
+        count(distinct duel_id) as duels,
+        sum(is_winner) as Total_Wins,
+        SUM(CASE WHEN number_in_duel = 2 THEN seconds_between_joins END) AS seconds_between_joins,
+        sum(duel_duration) as duel_duration,
+        COUNT(DISTINCT joined_2) AS joined_2,
+        COUNT(DISTINCT over) AS over,
+        COUNT(DISTINCT matching) AS matching,
+        COUNT(DISTINCT active) AS active,
+        SUM(votes_to_win) as votes_to_win,
+        COUNT(DISTINCT ONLY_1_IN_DUEL) AS ONLY_1_IN_DUEL,
+        count(distinct ten_Join_Coins) as ten_Join_Coins,
+        count(distinct thirty_Join_Coins) as thirty_Join_Coins,
+        count(distinct fifty_Join_Coins) as fifty_Join_Coins,
+        count(distinct hundred_Join_Coins) as hundred_Join_Coins
+    FROM (
+        SELECT 
+            dp.member_id,
+            dp.duel_id,
+            dp.join_date::date AS join_date,
+            dp.number_in_duel,
+            TIMESTAMPDIFF(SECOND, 
+                LAG(dp.join_date) OVER (PARTITION BY dp.duel_id ORDER BY dp.number_in_duel), 
+                dp.join_date) AS seconds_between_joins,
+ CASE WHEN CLOSED_ON IS NOT NULL THEN TIMESTAMPDIFF(SECOND,(case when dp.number_in_duel = 2 then join_date end),d.closed_on) end AS DUEL_duration,            
+ CASE WHEN dp.number_in_duel = 2 THEN dp.duel_id END AS joined_2,
+            CASE WHEN d.state = 'OVER' THEN dp.duel_id END AS over,
+            CASE WHEN d.state = 'MATCHING' THEN dp.duel_id END AS matching,
+            CASE WHEN d.state = 'ACTIVE' THEN dp.duel_id END AS active,
+            CASE WHEN (d.votes_goal - dp.votes) > 0 AND d.state = 'OVER' 
+                 THEN (d.votes_goal - dp.votes) 
+                 ELSE NULL 
+            END AS votes_to_win,
+            CASE WHEN (d.votes_goal - dp.votes) <= 0 AND d.state = 'OVER' 
+                 THEN 1 ELSE NULL 
+            END AS is_winner,
+            CASE WHEN dp.number_in_duel = 2 AND LAG(dp.join_date) OVER (PARTITION BY dp.duel_id ORDER BY dp.number_in_duel) IS NULL THEN dp.duel_id END AS ONLY_1_IN_DUEL,
+           case when TO_NUMBER(PARSE_JSON(CHALLENGE_DATA):duelJoinCoins)=10 then duel_id end as ten_Join_Coins,
+           case when TO_NUMBER(PARSE_JSON(CHALLENGE_DATA):duelJoinCoins)=30 then duel_id end as thirty_Join_Coins,
+           case when TO_NUMBER(PARSE_JSON(CHALLENGE_DATA):duelJoinCoins)=50 then duel_id end as fifty_Join_Coins,
+           case when TO_NUMBER(PARSE_JSON(CHALLENGE_DATA):duelJoinCoins)=100 then duel_id end as hundred_Join_Coins
+           
+        FROM 
+            PC_FIVETRAN_DB.GSMS_MAIN_DUELS.DUELS d
+        LEFT JOIN 
+            PC_FIVETRAN_DB.GSMS_MAIN_DUELS.DUEL_PARTICIPANTS dp 
+            ON d.id = dp.duel_id
+        WHERE 
+            d._fivetran_deleted = false 
+            AND dp._fivetran_deleted = false
+            and join_date>= '2024-12-08'
+    ) AS subquery
+    GROUP BY 
+        member_id, join_date::date
+),
+
+first_join AS (
+    SELECT member_id, min(join_date) as first_join_date
+    from duel_data
+    group by 1),
+        
+
+achievements as 
+    (SELECT 
+    u.member_id, 
+    u.reg_date, 
+    u.member_status_name,
+    u.country_code,
+    u.region,
+    u.reg_platform,
+    a.date::date AS achievement_date, 
+    count(distinct a.id) AS streak_achievements
+FROM 
+    dau u
+LEFT JOIN 
+    PC_FIVETRAN_DB.ACHIEVEMENTS_ACHIEVEMENTS.MEMBERS_ACHIEVEMENTS a
+    on u.member_id = a.item_id
+WHERE 
+    a._fivetran_deleted = false
+    and (u.reg_date<=a.date::date or a.date::date is null OR u.reg_date IS NULL)
+    and lower(a.type) like '%duel%' 
+GROUP BY 
+    u.member_id, 
+    u.reg_date, 
+    u.member_status_name,
+    u.country_code, 
+    u.region, 
+    u.reg_platform, 
+    a.date::date)
+
+SELECT distinct
+    dau.member_id, 
+    dau.reg_date, 
+    dau.member_status_name,
+    dau.country_code,
+    dau.region,
+    dau.reg_platform,
+    fj.first_join_date,
+    dau.date,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 1 then dau.member_id end as ret1,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 2 then dau.member_id end as ret2,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 3 then dau.member_id end as ret3,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 4 then dau.member_id end as ret4,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 5 then dau.member_id end as ret5,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 6 then dau.member_id end as ret6,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 7 then dau.member_id end as ret7,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 14 then dau.member_id end as ret14,
+    ifnull(MAX(p.revenue), 0) AS revenue,
+    ifnull(MAX(ri.PHOTO_SWAP_in), 0) AS PHOTO_SWAP_in,
+    ifnull(MAX(ri.KEY_in), 0) AS KEY_in,
+    ifnull(MAX(ri.COINS_in), 0) AS COINS_in,
+    ifnull(MAX(ri.EXPOSURE_AUTOFILL_in), 0) AS EXPOSURE_AUTOFILL_in,
+    ifnull(MAX(co.COINS_OUT), 0) AS COINS_OUT,
+    ifnull(MAX(dd.duels), 0) AS duels,
+    ifnull(MAX(dd.total_wins), 0) AS total_wins,
+    ifnull(max(dd.SECONDS_BETWEEN_joins), 0) as SECONDS_BETWEEN_joins,
+    ifnull(max(dd.duel_duration), 0) as duel_duration,
+    ifnull(MAX(dd.JOINED_2), 0) as JOINED_2,
+    ifnull(MAX(dd.OVER), 0) as OVER,
+    ifnull(MAX(dd.MATCHING), 0) as MATCHING,
+    ifnull(MAX(dd.ACTIVE), 0) as ACTIVE,
+    IFNULL(MAX(dd.only_1_in_duel), 0) as only_1_in_duel,
+    IFNULL(MAX(dd.votes_to_win), 0) as votes_to_win,
+    ifnull(MAX(streak_achievements), 0) as streak_achievements,
+    ifnull(MAX(ten_Join_Coins), 0) as ten_Join_coins,
+    ifnull(MAX(thirty_Join_Coins), 0) as thirty_Join_Coins,
+    ifnull(MAX(fifty_Join_Coins), 0) as fifty_Join_coins,
+    ifnull(MAX(hundred_Join_Coins), 0) as hundred_Join_coins
+FROM dau 
+LEFT JOIN payments p
+    ON dau.member_id = p.member_id 
+    AND dau.date = p.pay_date 
+LEFT JOIN resources_in ri 
+    ON dau.member_id = ri.member_id 
+    AND dau.date = ri.date 
+left join coins_out co
+     ON dau.member_id = co.member_id 
+    AND dau.date = co.date 
+left join duel_data dd
+        ON dau.member_id = dd.member_id 
+    AND dau.date = dd.join_date
+left join achievements a 
+    ON dau.member_id = a.member_id 
+        AND dau.date = a.achievement_date 
+left join first_join fj 
+    on dau.member_id = fj.member_id 
+    --WHERE dau.date  between '2024-12-08' and '2024-12-10'
+--where dau.member_id  =  '3ff6b667819be38752434193669f38af' 
+GROUP BY dau.member_id, 
+    dau.reg_date, 
+    dau.member_status_name,
+    dau.country_code,
+    dau.region,
+    dau.reg_platform,
+    fj.first_join_date,
+    dau.date,
+    datediff('day', fj.first_join_date, dd.join_date),
+    case when datediff('day', fj.first_join_date, dd.join_date) = 1 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 2 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 3 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 4 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 5 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 6 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 7 then dau.member_id end,
+    case when datediff('day', fj.first_join_date, dd.join_date) = 14 then dau.member_id end
